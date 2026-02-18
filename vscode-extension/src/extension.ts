@@ -1,8 +1,10 @@
 import * as vscode from 'vscode';
 import { SidebarProvider } from './SidebarProvider';
+import { Logger } from './Logger';
 
 export function activate(context: vscode.ExtensionContext) {
-	console.log('Fig2Code AI is now active');
+	Logger.init();
+	Logger.log('Fig2Code AI is now active');
 
 	const sidebarProvider = new SidebarProvider(context.extensionUri);
 	context.subscriptions.push(

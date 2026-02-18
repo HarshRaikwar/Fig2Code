@@ -4,8 +4,8 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "tsx src/index.ts",
-    "build": "tsc",
+    "start": "node init && tsx src/index.ts",
+    "build": "node init && tsc",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

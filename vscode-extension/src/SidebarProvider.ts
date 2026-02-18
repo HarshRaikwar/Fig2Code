@@ -1,7 +1,10 @@
 import * as vscode from 'vscode';
 import { FigmaClient } from './FigmaClient';
 import { Generator } from './Generator';
-
+import { AIService } from './AIService';
+import { Scaffolder } from './Scaffolder';
+import { CONFIG } from './Constants';
+import { Logger } from './Logger';
 
 export class SidebarProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'fig2code.sidebar';
@@ -36,18 +39,18 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           }
 
           try {
+            Logger.log(`Starting generation for URL: ${data.url}`);
             const { fileKey, nodeId } = FigmaClient.parseUrl(data.url);
             const client = new FigmaClient(token);
             const generator = new Generator();
 
-            vscode.window.showInformationMessage(`Fetching design from Figma...`);
+            Logger.log(`Fetching node ${nodeId || 'root'} from file ${fileKey}...`);
 
             let figmaNode;
             if (nodeId) {
               figmaNode = await client.getNode(fileKey, nodeId);
             } else {
               const fileData = await client.getFile(fileKey);
-              // Find the first frame or page
               figmaNode = fileData.document.children[0]; 
             }
 
@@ -55,71 +58,120 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
               throw new Error("Could not find a valid design node to convert.");
             }
 
+            Logger.log(`Converting node "${figmaNode.name}" to IR...`);
             const ir = generator.convertToIR(figmaNode);
             const htmlFragment = generator.generateHTML(ir);
             const css = generator.generateCSS(ir);
 
-            const workspaceFolders = vscode.workspace.workspaceFolders;
-            if (!workspaceFolders) {
-              throw new Error("Please open a workspace folder first to save the generated project.");
+            let projectFiles: Record<string, string> = {
+              'index.html': `<!DOCTYPE html><html><head><link rel="stylesheet" href="assets/css/style.css"></head><body>${htmlFragment}</body></html>`,
+              'assets/css/style.css': css
+            };
+
+            const userAiKey = config.get('aiApiKey') as string;
+            const activeAiKey = userAiKey || CONFIG.DEFAULT_AI_KEY;
+
+            if (activeAiKey && activeAiKey !== "AIzaSy...") { 
+              Logger.log(`Sending to Gemini AI for refinement (Model: gemini-1.5-flash)...`);
+              try {
+                const aiService = new AIService(activeAiKey);
+                projectFiles = await aiService.refineCode(ir, htmlFragment, data.framework);
+                Logger.log(`AI Refinement successful! Generated ${Object.keys(projectFiles).length} files.`);
+              } catch (e) {
+                Logger.error(`AI Refinement failed, falling back to raw:`, e);
+                vscode.window.showWarningMessage("AI Refinement failed, using raw conversion.");
+              }
             }
 
-            const projectRoot = workspaceFolders[0].uri;
-            const timestamp = new Date().getTime();
-            const projectFolderName = `fig2code-export-${timestamp}`;
+            this._view?.webview.postMessage({ 
+              type: 'generationFinished', 
+              code: { 
+                files: projectFiles,
+                nodeName: figmaNode.name,
+                framework: data.framework
+              } 
+            });
+            
+          } catch (error: any) {
+            Logger.error(`Generation failed:`, error);
+            vscode.window.showErrorMessage(`Generation failed: ${error.message}`);
+            this._view?.webview.postMessage({ type: 'error', message: error.message });
+          }
+          break;
+        }
+        case 'onApplyCode': {
+          const { code } = data;
+          try {
+            let projectRoot: vscode.Uri | undefined;
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+
+            if (workspaceFolders && workspaceFolders.length > 0) {
+              projectRoot = workspaceFolders[0].uri;
+            } else {
+              const selectedFolder = await vscode.window.showOpenDialog({
+                canSelectFiles: false,
+                canSelectFolders: true,
+                canSelectMany: false,
+                openLabel: 'Select Folder to Save Project'
+              });
+
+              if (selectedFolder && selectedFolder.length > 0) {
+                projectRoot = selectedFolder[0];
+              }
+            }
+
+            if (!projectRoot) {
+              throw new Error("No destination folder selected.");
+            }
+
+            const projectFolderName = `fig2code-${code.framework}-${new Date().getTime()}`;
             const projectFolderUri = vscode.Uri.joinPath(projectRoot, projectFolderName);
 
-            // Create project directory
             await vscode.workspace.fs.createDirectory(projectFolderUri);
 
-            const htmlContent = `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${figmaNode.name || 'Generated Design'}</title>
-    <link rel="stylesheet" href="style.css">
-</head>
-<body>
-${htmlFragment}
-</body>
-</html>`;
+            Logger.log(`Applying project "${code.nodeName}" to folder: ${projectFolderUri.fsPath}`);
 
-            const htmlUri = vscode.Uri.joinPath(projectFolderUri, 'index.html');
-            const cssUri = vscode.Uri.joinPath(projectFolderUri, 'style.css');
+            if (code.framework === 'react') {
+              await Scaffolder.createReactTailwind(projectFolderUri, code.files, code.nodeName);
+            } else {
+              await Scaffolder.createHtmlCss(projectFolderUri, code.files, code.nodeName);
+            }
 
-            await vscode.workspace.fs.writeFile(htmlUri, Buffer.from(htmlContent, 'utf8'));
-            await vscode.workspace.fs.writeFile(cssUri, Buffer.from(css, 'utf8'));
-
-            const doc = await vscode.workspace.openTextDocument(htmlUri);
-            await vscode.window.showTextDocument(doc);
+            Logger.log(`Project scaffolding complete.`);
+            vscode.window.showInformationMessage(`Project created: ${projectFolderName}`);
             
-            vscode.window.showInformationMessage(`Successfully generated project in folder: ${projectFolderName}`);
+            if (!workspaceFolders) {
+               vscode.workspace.updateWorkspaceFolders(0, 0, { uri: projectFolderUri, name: projectFolderName });
+            }
+
+            let mainFile = code.framework === 'react' ? 'src/App.tsx' : 'index.html';
+            const possibleFiles = Object.keys(code.files);
+            if (!possibleFiles.includes(mainFile)) {
+                mainFile = possibleFiles.find(f => f.endsWith('.tsx') || f.endsWith('.html')) || possibleFiles[0];
+            }
+
+            const doc = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(projectFolderUri, mainFile));
+            await vscode.window.showTextDocument(doc);
+
           } catch (error: any) {
-            vscode.window.showErrorMessage(`Generation failed: ${error.message}`);
-          } finally {
-            this._view?.webview.postMessage({ type: 'generationFinished' });
+            vscode.window.showErrorMessage(`Apply failed: ${error.message}`);
           }
           break;
         }
         case 'onSaveToken': {
-          await vscode.workspace.getConfiguration('fig2code').update('figmaToken', data.token, true);
+          const config = vscode.workspace.getConfiguration('fig2code');
+          if (data.token) await config.update('figmaToken', data.token, true);
+          if (data.aiKey) await config.update('aiApiKey', data.aiKey, true);
           await this._view?.webview.postMessage({ type: 'tokenSaved' });
-          vscode.window.showInformationMessage("Figma Token linked successfully!");
           break;
         }
         case 'getInitialState': {
           const config = vscode.workspace.getConfiguration('fig2code');
-          const token = config.get('figmaToken');
           this._view?.webview.postMessage({ 
             type: 'state', 
-            hasToken: !!token 
+            hasToken: !!config.get('figmaToken'),
+            hasAiKey: !!config.get('aiApiKey')
           });
-          break;
-        }
-        case 'onLogout': {
-          await vscode.workspace.getConfiguration('fig2code').update('figmaToken', '', true);
-          this._view?.webview.postMessage({ type: 'state', hasToken: false });
           break;
         }
       }
@@ -133,220 +185,271 @@ ${htmlFragment}
   }
 
   private _getHtmlForWebview(webview: vscode.Webview) {
-    const styleResetUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'reset.css'));
-    const styleVSCodeUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'vscode.css'));
-
     return `<!DOCTYPE html>
 			<html lang="en">
 			<head>
 				<meta charset="UTF-8">
 				<meta name="viewport" content="width=device-width, initial-scale=1.0">
-				<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
+				<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Outfit:wght@700;800&display=swap" rel="stylesheet">
 				<style>
 					:root {
-						--primary-gradient: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
-						--card-bg: rgba(30, 30, 45, 0.7);
+						--bg-dark: #0f172a;
+						--card-bg: rgba(30, 41, 59, 0.7);
+						--accent-primary: #6366f1;
+						--accent-secondary: #a855f7;
+						--text-main: #f8fafc;
+						--text-dim: #94a3b8;
 						--glass-border: rgba(255, 255, 255, 0.1);
-						--accent-color: #a855f7;
+						--gradient-main: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
 					}
-					body { 
-						font-family: 'Inter', sans-serif; 
-						padding: 16px; 
-						color: #e2e8f0;
+
+					* { box-sizing: border-box; margin: 0; padding: 0; }
+
+					body {
+						font-family: 'Inter', sans-serif;
 						background-color: transparent;
-						overflow-x: hidden;
+						color: var(--text-main);
+						height: 100vh;
+						display: flex;
+						flex-direction: column;
+						overflow: hidden;
 					}
-					.screen { display: none; animation: fadeIn 0.4s ease-out; }
-					.screen.active { display: flex; flex-direction: column; }
-					
-					@keyframes fadeIn {
-						from { opacity: 0; transform: translateY(10px); }
+
+					.app-container { flex: 1; display: flex; flex-direction: column; position: relative; height: 100%; }
+
+					.main-content {
+						flex: 1;
+						overflow-y: auto;
+						padding: 20px;
+						padding-bottom: 120px;
+						scrollbar-width: thin;
+						scrollbar-color: var(--accent-primary) transparent;
+					}
+
+					.screen { display: none; animation: slideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
+					.screen.active { display: block; }
+
+					@keyframes slideUp {
+						from { opacity: 0; transform: translateY(20px); }
 						to { opacity: 1; transform: translateY(0); }
 					}
 
-					h1 { font-family: 'Outfit', sans-serif; font-size: 1.8rem; margin-bottom: 8px; background: var(--primary-gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 700; }
-					p { font-size: 0.9rem; opacity: 0.8; line-height: 1.5; margin-bottom: 20px; }
-
-					.card { 
-						background: var(--card-bg); 
-						backdrop-filter: blur(10px);
-						border: 1px solid var(--glass-border); 
-						padding: 20px; 
-						border-radius: 12px;
-						box-shadow: 0 8px 32px rgba(0,0,0,0.2);
-						margin-bottom: 16px;
+					h1 { 
+						font-family: 'Outfit', sans-serif; 
+						font-size: 2.2rem; 
+						line-height: 1.1;
+						margin-bottom: 12px;
+						background: var(--gradient-main);
+						-webkit-background-clip: text;
+						-webkit-text-fill-color: transparent;
 					}
 
-					.input-group { margin-bottom: 16px; }
-					label { display: block; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; margin-bottom: 6px; color: var(--accent-color); letter-spacing: 0.05em; }
-					
-					input, select { 
-						width: 100%; 
-						padding: 10px 12px; 
-						background: rgba(255,255,255,0.05); 
-						border: 1px solid var(--glass-border); 
-						color: #fff; 
-						border-radius: 6px; 
-						font-size: 0.9rem;
-						transition: all 0.2s;
-					}
-					input:focus { border-color: var(--accent-color); outline: none; background: rgba(255,255,255,0.1); }
+					.welcome-text { font-size: 1.1rem; color: var(--text-dim); margin-bottom: 30px; }
 
-					button { 
-						cursor: pointer; 
-						padding: 12px; 
-						background: var(--primary-gradient); 
-						color: #fff; 
-						border: none; 
-						border-radius: 8px; 
-						width: 100%; 
-						font-weight: 600; 
-						font-size: 0.95rem;
-						transition: transform 0.2s, box-shadow 0.2s;
-						display: flex; align-items: center; justify-content: center; gap: 8px;
+					.glass-card {
+						background: var(--card-bg);
+						backdrop-filter: blur(12px);
+						border: 1px solid var(--glass-border);
+						border-radius: 16px;
+						padding: 20px;
+						margin-bottom: 20px;
 					}
-					button:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(168, 85, 247, 0.4); }
-					button:active { transform: translateY(0); }
-					
-					.btn-secondary { background: rgba(255,255,255,0.1); color: #fff; margin-top: 8px; }
-					.btn-secondary:hover { background: rgba(255,255,255,0.15); }
 
-					.feature-list { list-style: none; padding: 0; margin-bottom: 24px; }
-					.feature-item { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; font-size: 0.85rem; }
-					.check { color: #10b981; font-weight: bold; }
-
-					.loader {
-						border: 2px solid rgba(255,255,255,0.1);
-						border-top: 2px solid #fff;
-						border-radius: 50%; width: 16px; height: 16px; animation: spin 1s linear infinite;
-						display: none;
+					/* --- Review Layout --- */
+					.review-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+					.review-layout { display: flex; gap: 12px; height: 400px; }
+					.file-list { width: 100px; display: flex; flex-direction: column; gap: 5px; overflow-y: auto; }
+					.file-item {
+						font-size: 0.6rem;
+						padding: 6px;
+						background: rgba(255,255,255,0.05);
+						border-radius: 4px;
+						cursor: pointer;
+						color: var(--text-dim);
+						white-space: nowrap;
+						overflow: hidden;
+						text-overflow: ellipsis;
 					}
-					@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+					.file-item.active { background: var(--accent-primary); color: white; }
+
+					.code-preview {
+						flex: 1;
+						background: #011627;
+						color: #d6deeb;
+						padding: 12px;
+						border-radius: 8px;
+						font-family: 'Fira Code', monospace;
+						font-size: 0.7rem;
+						white-space: pre-wrap;
+						overflow-y: auto;
+					}
+
+					.bottom-panel {
+						position: absolute; bottom: 0; left: 0; right: 0;
+						background: rgba(15, 23, 42, 0.95);
+						border-top: 1px solid var(--glass-border);
+						padding: 16px;
+						z-index: 100;
+					}
+
+					.input-wrapper {
+						background: rgba(255,255,255,0.05);
+						border: 1px solid var(--glass-border);
+						border-radius: 10px;
+						display: flex;
+						padding: 2px;
+						margin-bottom: 10px;
+					}
+
+					input { background: transparent; border: none; color: white; padding: 10px; flex: 1; outline: none; }
+
+					.send-btn {
+						background: var(--gradient-main);
+						border: none; color: white; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer;
+					}
+
+					.btn-sm { padding: 6px 12px; font-size: 0.75rem; border-radius: 6px; cursor: pointer; border: none; }
+					.btn-apply { background: var(--accent-primary); color: white; }
+					.btn-discard { background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2); }
+
+                    .loader-overlay {
+						position: absolute; inset: 0; background: rgba(15, 23, 42, 0.8);
+						display: none; flex-direction: column; align-items: center; justify-content: center; z-index: 1000;
+					}
+					.spinner { width: 40px; height: 40px; border: 3px solid rgba(99, 102, 241, 0.1); border-top-color: var(--accent-primary); border-radius: 50%; animation: spin 0.8s linear infinite; }
+					@keyframes spin { to { transform: rotate(360deg); } }
 				</style>
 			</head>
 			<body>
-				<!-- WELCOME SCREEN -->
-				<div id="welcomeScreen" class="screen">
-					<h1>Fig2Code AI</h1>
-					<p>Transform your high-fidelity Figma designs into clean, production-ready code in seconds.</p>
-					
-					<ul class="feature-list">
-						<li class="feature-item"><span class="check">✓</span> Semantic HTML5 & CSS</li>
-						<li class="feature-item"><span class="check">✓</span> Modern Framework Support</li>
-						<li class="feature-item"><span class="check">✓</span> AI-Powered Layout Refinement</li>
-					</ul>
-
-					<button id="startSetup">Get Started</button>
-				</div>
-
-				<!-- TOKEN SCREEN -->
-				<div id="tokenScreen" class="screen">
-					<h1>Link Figma</h1>
-					<p>To access your designs, we need a Personal Access Token.</p>
-					
-					<div class="card">
-						<div class="input-group">
-							<label>Personal Access Token</label>
-							<input type="password" id="figmaToken" placeholder="figp_xxxxxxxxxxxxxxx">
-							<p style="font-size: 0.7rem; margin-top: 8px; opacity: 0.6;">You can generate this in Figma > Settings > Personal Access Tokens.</p>
+				<div class="app-container">
+					<div class="main-content">
+						<div id="homeScreen" class="screen active">
+							<h1>Fig2Code AI</h1>
+							<p class="welcome-text">Industry standard Figma-to-Code conversion.</p>
+							<div class="glass-card">
+								<ul style="list-style: none; font-size: 0.8rem; display: flex; flex-direction: column; gap: 8px;">
+									<li>✨ AI-powered semantics</li>
+									<li>🏗️ Multi-file scaffolding</li>
+									<li>🚀 Ready for production</li>
+								</ul>
+							</div>
 						</div>
-						<button id="saveTokenBtn">Link Account</button>
-						<button id="backToWelcome" class="btn-secondary">Go Back</button>
+
+						<div id="reviewScreen" class="screen">
+							<div class="review-header">
+								<div style="font-weight: 700;">Project Preview</div>
+								<div style="display: flex; gap: 8px;">
+									<button class="btn-sm btn-discard" onclick="discardCode()">Discard</button>
+									<button class="btn-sm btn-apply" onclick="applyCode()">Apply Project</button>
+								</div>
+							</div>
+							<div class="review-layout">
+								<div class="file-list" id="fileList"></div>
+								<div class="code-preview" id="codeDisplay"></div>
+							</div>
+						</div>
+
+						<div id="setupScreen" class="screen">
+							<h1>Settings</h1>
+							<div class="glass-card">
+								<label style="font-size: 0.7rem; color: var(--accent-primary); font-weight: 700; display: block; margin-bottom: 5px;">FIGMA TOKEN (REQ)</label>
+								<div class="input-wrapper"><input type="password" id="figmaTokenInput" /></div>
+								<label style="font-size: 0.7rem; color: var(--text-dim); display: block; margin-top: 15px;">CUSTOM AI KEY (OPTIONAL)</label>
+								<div class="input-wrapper"><input type="password" id="aiKeyInput" /></div>
+								<button class="send-btn" style="width: 100%; margin-top: 10px;" id="saveSetupBtn">Save</button>
+								<button class="btn-sm" style="width: 100%; margin-top: 10px; background: transparent; color: var(--text-dim);" onclick="showScreen('home')">Back</button>
+							</div>
+						</div>
 					</div>
-				</div>
 
-				<!-- GENERATOR SCREEN -->
-				<div id="generatorScreen" class="screen">
-					<h1>Generator</h1>
-					<p>Paste your design link and choose your destination framework.</p>
+					<div id="loader" class="loader-overlay"><div class="spinner"></div></div>
 
-					<div class="card">
-						<div class="input-group">
-							<label>Figma Design URL</label>
-							<input type="text" id="figmaUrl" placeholder="https://www.figma.com/file/...">
+					<div class="bottom-panel">
+						<div class="input-wrapper">
+							<input type="text" id="figmaUrl" placeholder="Figma URL..." />
+							<button class="send-btn" id="generateBtn">Send</button>
 						</div>
-
-						<div class="input-group">
-							<label>Framework / Template</label>
-							<select id="frameworkSelect">
-								<option value="html">Semantic HTML5 + CSS</option>
-								<option value="react">React + Tailwind</option>
-								<option value="nextjs">Next.js + CSS Modules</option>
-								<option value="laravel">Laravel Blade Templates</option>
+						<div style="display: flex; justify-content: space-between; align-items: center;">
+							<select id="frameworkSelect" style="background: rgba(255,255,255,0.05); color: var(--text-dim); border: none; border-radius: 4px; padding: 4px;">
+								<option value="html" selected>CSS & HTML (Standard)</option>
+								<option value="react">React & Tailwind (Beta)</option>
 							</select>
+							<button id="settingsBtn" style="background: none; border: none; color: var(--text-dim); cursor: pointer;">⚙️</button>
 						</div>
-
-						<button id="generateBtn">
-							<span class="loader" id="mainLoader"></span>
-							<span id="btnText">Convert to Code</span>
-						</button>
 					</div>
-
-					<button id="logoutBtn" class="btn-secondary" style="font-size: 0.7rem; padding: 6px;">Unlink Figma Account</button>
 				</div>
 
 				<script>
 					const vscode = acquireVsCodeApi();
-					
-					// DOM Elements
-					const screens = {
-						welcome: document.getElementById('welcomeScreen'),
-						token: document.getElementById('tokenScreen'),
-						generator: document.getElementById('generatorScreen')
-					};
+					let lastGeneratedCode = null;
 
-					function showScreen(screenId) {
-						Object.values(screens).forEach(s => s.classList.remove('active'));
-						screens[screenId].classList.add('active');
+					const homeScreen = document.getElementById('homeScreen');
+					const reviewScreen = document.getElementById('reviewScreen');
+					const setupScreen = document.getElementById('setupScreen');
+					const loader = document.getElementById('loader');
+					const codeDisplay = document.getElementById('codeDisplay');
+					const fileList = document.getElementById('fileList');
+
+					function showScreen(id) {
+						[homeScreen, reviewScreen, setupScreen].forEach(s => s.classList.remove('active'));
+						document.getElementById(id + 'Screen').classList.add('active');
 					}
 
-					// Initial State Request
-					vscode.postMessage({ type: 'getInitialState' });
-
 					window.addEventListener('message', event => {
-						const message = event.data;
-						switch (message.type) {
-							case 'state':
-								if (message.hasToken) {
-									showScreen('generator');
-								} else {
-									showScreen('welcome');
-								}
-								break;
-							case 'tokenSaved':
-								showScreen('generator');
-								break;
-							case 'generationFinished':
-								document.getElementById('mainLoader').style.display = 'none';
-								document.getElementById('btnText').innerText = 'Convert to Code';
-								break;
+						const msg = event.data;
+						if (msg.type === 'generationFinished') {
+							loader.style.display = 'none';
+							if (msg.code) {
+								lastGeneratedCode = msg.code;
+								renderFiles();
+								showScreen('review');
+							}
+						} else if (msg.type === 'tokenSaved') {
+							alert('Settings saved!');
+							showScreen('home');
+						} else if (msg.type === 'error') {
+							loader.style.display = 'none';
+							alert(msg.message);
 						}
 					});
 
-					// Button Listeners
-					document.getElementById('startSetup').onclick = () => showScreen('token');
-					document.getElementById('backToWelcome').onclick = () => showScreen('welcome');
-					
-					document.getElementById('saveTokenBtn').onclick = () => {
-						const token = document.getElementById('figmaToken').value;
-						if (token) {
-							vscode.postMessage({ type: 'onSaveToken', token });
-						}
-					};
+					function renderFiles() {
+						fileList.innerHTML = '';
+						const keys = Object.keys(lastGeneratedCode.files);
+						keys.forEach((path, i) => {
+							const div = document.createElement('div');
+							div.className = 'file-item' + (i === 0 ? ' active' : '');
+							div.textContent = path.split('/').pop();
+							div.onclick = () => {
+								document.querySelectorAll('.file-item').forEach(e => e.classList.remove('active'));
+								div.classList.add('active');
+								codeDisplay.textContent = lastGeneratedCode.files[path];
+							};
+							fileList.appendChild(div);
+							if (i === 0) codeDisplay.textContent = lastGeneratedCode.files[path];
+						});
+					}
 
 					document.getElementById('generateBtn').onclick = () => {
 						const url = document.getElementById('figmaUrl').value;
 						const framework = document.getElementById('frameworkSelect').value;
 						if (url) {
-							document.getElementById('mainLoader').style.display = 'inline-block';
-							document.getElementById('btnText').innerText = 'Processing...';
+							loader.style.display = 'flex';
 							vscode.postMessage({ type: 'onGenerate', url, framework });
 						}
 					};
 
-					document.getElementById('logoutBtn').onclick = () => {
-						vscode.postMessage({ type: 'onLogout' });
+					document.getElementById('settingsBtn').onclick = () => showScreen('setup');
+					document.getElementById('saveSetupBtn').onclick = () => {
+						vscode.postMessage({ 
+							type: 'onSaveToken', 
+							token: document.getElementById('figmaTokenInput').value,
+							aiKey: document.getElementById('aiKeyInput').value 
+						});
 					};
+
+					function applyCode() { vscode.postMessage({ type: 'onApplyCode', code: lastGeneratedCode }); }
+					function discardCode() { showScreen('home'); }
 				</script>
 			</body>
 			</html>`;
