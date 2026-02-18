@@ -1,0 +1,75 @@
+{
+  "name": "fig2code",
+  "displayName": "Fig2Code AI",
+  "description": "Figma-to-Semantic-Code with AI Intelligence",
+  "version": "1.0.0",
+  "publisher": "hackathon-team",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "fig2code-explorer",
+          "title": "Fig2Code AI",
+          "icon": "$(layout)"
+        }
+      ]
+    },
+    "views": {
+      "fig2code-explorer": [
+        {
+          "type": "webview",
+          "id": "fig2code.sidebar",
+          "name": "Generator"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "fig2code.generate",
+        "title": "Generate Code from Figma URL"
+      }
+    ],
+    "configuration": {
+      "title": "Fig2Code",
+      "properties": {
+        "fig2code.figmaToken": {
+          "type": "string",
+          "default": "",
+          "description": "Figma Personal Access Token"
+        },
+        "fig2code.aiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Gemini/OpenAI API Key for AI Refinement"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "webpack",
+    "watch": "webpack --watch",
+    "package": "webpack --mode production",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out"
+  },
+  "devDependencies": {
+    "@types/node": "18.x",
+    "@types/vscode": "^1.80.0",
+    "ts-loader": "^9.4.4",
+    "typescript": "^5.1.6",
+    "webpack": "^5.88.2",
+    "webpack-cli": "^5.1.4"
+  },
+  "dependencies": {
+    "axios": "^1.13.5"
+  }
+}
