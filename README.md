@@ -1,4 +1,4 @@
-# Fig2Code AI 🚀
+# Fig2Code 🚀
 
 > **Turning Design into Code with Intelligence.**
 
