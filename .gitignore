@@ -22,17 +22,15 @@ yarn-debug.log*
 yarn-error.log*
 
 # Environment
-.env
-.env.local
 .env.development.local
 .env.test.local
 .env.production.local
 
 # VS Code
-.vscode/*
 !.vscode/launch.json
 !.vscode/tasks.json
 
 # Fig2Code specific
 *.vsix
 fig2code-tools/
+config.bat
